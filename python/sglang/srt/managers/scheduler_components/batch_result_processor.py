@@ -469,7 +469,7 @@ class SchedulerBatchResultProcessor:
                             # Keep the prefix cached for the next call with
                             # this rid, but give back the req-pool slot.
                             maybe_cache_unfinished_req(req, self.tree_cache)
-                            self.req_to_token_pool.free(req.req_pool_idx)
+                            self.req_to_token_pool.free(req)
                             if (
                                 self.stream_queue is not None
                                 and req.rid in self.stream_queue
