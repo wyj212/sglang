@@ -2755,7 +2755,7 @@ class Scheduler(
         existing_req.origin_input_ids.extend(input_ids)
         existing_req.return_logprob_len = len(input_ids)
         existing_req.finished_reason = None
-        existing_req.output_ids = []
+        existing_req.output_ids = array("q")
         existing_req.resumable = req.resumable
         return existing_req
 
