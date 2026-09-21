@@ -24,6 +24,14 @@ MODEL_OVERRIDES: Dict[str, Dict[str, Any]] = {
     # (faithful port of the legacy unconditional arch branch).
     "MistralLarge3ForCausalLM": {"dtype": "bfloat16"},
     "PixtralForConditionalGeneration": {"dtype": "bfloat16"},
+    # Qwen3Guard-Stream classifies a whole prefill in one pass and has no
+    # decode loop. Overlap scheduling, chunked prefill and the radix cache all
+    # assume an incremental generation request, so they must be off.
+    "Qwen3ForGuardModel": {
+        "disable_overlap_schedule": True,
+        "chunked_prefill_size": -1,
+        "disable_radix_cache": True,
+    },
 }
 
 

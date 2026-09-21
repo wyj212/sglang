@@ -978,6 +978,7 @@ class Req(ReqDllmMixin):
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        resumable: Optional[bool] = False,
     ):
         # Input and output info
         self.rid = rid
@@ -1313,6 +1314,10 @@ class Req(ReqDllmMixin):
         # first prefill batch; the cached-prefix early-send never goes past it.
         self.early_send_prefix_end: Optional[int] = None
         self.metadata_buffer_index: int = -1
+        # Qwen3Guard-Stream: this request will be resumed with more tokens.
+        self.resumable: bool = resumable
+        # Number of trailing tokens whose logits the caller wants back.
+        self.return_logprob_len = None
         # Used in overlap sequence to signal that an optimistic request should
         # abort chunking. Set in create_sender, consumed in process_batch_result.
         self.pending_bootstrap = False

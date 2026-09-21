@@ -6,6 +6,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Callable,
+    Dict,
     List,
     Optional,
     Tuple,
@@ -73,6 +74,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.utils import (
         EmbeddingBatchResult,
         GenerationBatchResult,
+        StreamGuardResult,
     )
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -95,6 +97,11 @@ def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
+    # Qwen3Guard-Stream: classification-only architecture, no decode loop.
+    is_stream_guard: bool = False
+    # The Scheduler's live dict, shared by reference so resumable requests
+    # stay reachable across calls.
+    stream_queue: Optional[Dict[str, Req]] = None
     disaggregation_mode: DisaggregationMode
     enable_overlap: bool
     enable_overlap_mlx: bool
@@ -257,7 +264,7 @@ class SchedulerBatchResultProcessor:
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        result: Union[GenerationBatchResult, EmbeddingBatchResult, StreamGuardResult],
     ):
         skip_stream_req = None
         self.token_to_kv_pool_allocator.free_group_begin()
@@ -440,6 +447,43 @@ class SchedulerBatchResultProcessor:
                     auxiliary_output_starts,
                 )
 
+        elif self.is_stream_guard:
+            # Qwen3Guard-Stream: the logits are the output; no tokens are
+            # generated, so a dummy token ends the request after one pass.
+            for req in batch.reqs:
+                if req.is_retracted:
+                    continue
+
+                if req.inflight_middle_chunks <= 0:
+                    req.time_stats.set_prefill_finished_time()
+                    req.output_ids.append(0)
+                    req.update_finish_state()
+
+                    if req.finished():
+                        if not req.resumable:
+                            release_kv_cache(req, self.tree_cache)
+                            req.time_stats.set_completion_time()
+                            if self.stream_queue is not None:
+                                self.stream_queue.pop(req.rid, None)
+                        else:
+                            # Keep the prefix cached for the next call with
+                            # this rid, but give back the req-pool slot.
+                            maybe_cache_unfinished_req(req, self.tree_cache)
+                            self.req_to_token_pool.free(req.req_pool_idx)
+                            if (
+                                self.stream_queue is not None
+                                and req.rid in self.stream_queue
+                            ):
+                                self.stream_queue[req.rid].prefix_indices = (
+                                    req.prefix_indices
+                                )
+                    else:
+                        maybe_cache_unfinished_req(req, self.tree_cache)
+                else:
+                    # being chunked reqs' prefill is not finished
+                    req.inflight_middle_chunks -= 1
+                    req.time_stats.set_last_chunked_prefill_finish_time()
+
         else:  # embedding or reward model
             if result.copy_done is not None:
                 result.copy_done.synchronize()
@@ -479,7 +523,10 @@ class SchedulerBatchResultProcessor:
 
         self.token_to_kv_pool_allocator.free_group_end()
         self.output_streamer.stream_output(
-            batch.reqs, batch.return_logprob, skip_stream_req
+            batch.reqs,
+            batch.return_logprob,
+            skip_stream_req,
+            result=result if self.is_stream_guard else None,
         )
 
         can_run_cuda_graph = result.can_run_cuda_graph

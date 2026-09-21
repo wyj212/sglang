@@ -278,6 +278,7 @@ from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
+    StreamGuardResult,
     is_health_check_generate_req,
     validate_input_length,
 )
@@ -690,6 +691,14 @@ class Scheduler(
         self.init_dsa_kpool_truncation_align()
 
         self.init_weight_updater()
+
+        # Qwen3Guard-Stream: one classification pass per call, no decode loop.
+        # Requests marked resumable stay in stream_queue between calls so a
+        # later call with the same rid extends the same sequence.
+        self.is_stream_guard = (
+            self.model_config.hf_config.architectures[0] == "Qwen3ForGuardModel"
+        )
+        self.stream_queue: Dict[str, Req] = {}
 
         # Init request dispatcher
         self.init_request_dispatcher()
@@ -2461,6 +2470,7 @@ class Scheduler(
             ps=self.ps,
             server_args=self.server_args,
             is_generation=self.is_generation,
+            is_stream_guard=self.is_stream_guard,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             enable_hicache_storage=lambda: self.enable_hicache_storage,
@@ -2486,6 +2496,8 @@ class Scheduler(
         self.init_beam_coordinator()
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
+            is_stream_guard=self.is_stream_guard,
+            stream_queue=self.stream_queue,
             disaggregation_mode=self.disaggregation_mode,
             enable_overlap=self.enable_overlap,
             enable_overlap_mlx=self.enable_overlap_mlx,
@@ -2721,6 +2733,32 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def resume(self, recv_req: TokenizedGenerateReqInput, req: Req) -> Req:
+        """Attach a Qwen3Guard-Stream call to the sequence its rid names.
+
+        The first call for an rid registers the request.  Later calls carry
+        only the newly produced tokens, which are appended to the sequence
+        already in flight; ``return_logprob_len`` records how many trailing
+        tokens the caller wants logits for.
+        """
+        if recv_req.rid not in self.stream_queue:
+            self.stream_queue[recv_req.rid] = req
+            return req
+        existing_req = self.stream_queue[recv_req.rid]
+        input_ids = recv_req.input_ids
+        if (
+            self.tokenizer is not None
+            and len(input_ids) > 0
+            and input_ids[0] == self.tokenizer.bos_token_id
+        ):
+            input_ids = input_ids[1:]
+        existing_req.origin_input_ids.extend(input_ids)
+        existing_req.return_logprob_len = len(input_ids)
+        existing_req.finished_reason = None
+        existing_req.output_ids = []
+        existing_req.resumable = req.resumable
+        return existing_req
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -2789,7 +2827,12 @@ class Scheduler(
                 dllm_config=self.dllm_config,
                 time_stats=recv_req.time_stats,
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
+                resumable=recv_req.resumable,
             )
+
+            if self.is_stream_guard:
+                req = self.resume(recv_req, req)
+
             req.tokenizer = self.tokenizer
 
             if radix_native_session:
@@ -3656,6 +3699,11 @@ class Scheduler(
             new_batch = prefill_plan.batch_to_run
             running_batch = prefill_plan.running_batch
 
+        if self.is_stream_guard:
+            # Guard requests never decode; nothing may carry over to the next
+            # iteration's running batch.
+            running_batch.filter_batch(keep_indices=[])
+
         need_mlp_sync = self.require_mlp_sync
         if (
             need_mlp_sync
@@ -4246,7 +4294,7 @@ class Scheduler(
         self,
         batch: ScheduleBatch,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
-    ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
+    ) -> Union[GenerationBatchResult, EmbeddingBatchResult, StreamGuardResult]:
         """Run a batch."""
         self.metrics_reporter.record_scheduler_active()
         self.forward_ct += 1
@@ -4446,6 +4494,11 @@ class Scheduler(
                 batch_result.extend_logprob_start_len_per_req = None
 
             ret = batch_result
+        elif self.is_stream_guard:
+            # Overlap scheduling is forced off for this architecture
+            # (MODEL_OVERRIDES), so only the synchronous path can be reached.
+            resolve_forward_inputs(batch, self.future_map)
+            ret = self.tp_worker.forward_stream_guard(batch)
         else:  # embedding or reward model
             if self.enable_overlap:
                 self.record_batch_in_overlap(batch)
@@ -4594,7 +4647,7 @@ class Scheduler(
     def process_batch_result(
         self,
         batch: ScheduleBatch,
-        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+        result: Union[GenerationBatchResult, EmbeddingBatchResult, StreamGuardResult],
     ):
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
@@ -4759,7 +4812,14 @@ class Scheduler(
             and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
         )
         with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
-            if not self.enable_hisparse and not deferred_pending:
+            # Qwen3Guard-Stream is skipped too: resumable requests deliberately
+            # hold KV between calls while not being in the running batch, which
+            # the idle leak invariant would read as a leak.
+            if (
+                not self.enable_hisparse
+                and not deferred_pending
+                and not self.is_stream_guard
+            ):
                 has_leak, messages = self.invariant_checker._check_all_pools(
                     self.pool_stats_observer.get_pool_stats(),
                 )
